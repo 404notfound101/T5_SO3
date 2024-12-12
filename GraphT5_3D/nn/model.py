@@ -1,23 +1,78 @@
+from __future__ import annotations
 import torch
+from typing import Tuple
 from jaxtyping import Float, Int64
 from dataclasses import dataclass
 from GraphT5_3D.nn.modules.RoPE import precomputed_theta_pos_frequencies
+from GraphT5_3D.nn.modules.frame_averaging import create_frames, apply_frames, invert_frames
 from GraphT5_3D.nn.modules.norm import RMSNorm
 from GraphT5_3D.nn.modules.transformer import MultiheadAttentionZero, FeedForward
 
 @dataclass
-class InFrameInput:
-    EncoderSequence: Int64[torch.Tensor, "batch_size e_seq_len"]
-    Encodercoords: Float[torch.Tensor, "batch_size e_seq_len num_atoms*3"]
-    Encodermask: Float[torch.Tensor, "batch_size e_seq_len"]
-    DecoderSequence: Int64[torch.Tensor, "batch_size d_seq_len"]
-    Decodercoords: Float[torch.Tensor, "batch_size d_seq_len num_atoms*3"]
-    Decodermask: Float[torch.Tensor, "batch_size d_seq_len"]
+class TransformerInput:
+    sequence: Int64[torch.Tensor, "batch_size seq_len"]
+    coords: Float[torch.Tensor, "batch_size seq_len 3 3"]
+    padding_mask: Float[torch.Tensor, "batch_size seq_len"]
+    common_token_mask: Float[torch.Tensor, "batch_size seq_len"]
+
+    def get_input_slice(self) -> TransformerInput:
+        return TransformerInput(
+            sequence=self.sequence[:, :-1],
+            coords=self.coords[:, :-1],
+            padding_mask=self.padding_mask[:, :-1],
+            common_token_mask=self.common_token_mask[:, :-1]
+        )
+    
+    def get_target_slice(self) -> TransformerInput:
+        return TransformerInput(
+            sequence=self.sequence[:, 1:],
+            coords=self.coords[:, 1:],
+            padding_mask=self.padding_mask[:, 1:],
+            common_token_mask=self.common_token_mask[:, 1:]
+        )
+
+    def create_frames(self) -> Tuple[Float[torch.Tensor, "batch_size 4 3 3"], Float[torch.Tensor, "batch_size 1 3"]]:
+        frames, center = create_frames(self.coords, self.common_token_mask)
+        self.frames = frames
+        self.center = center
+        return frames, center
+
+    def apply_frames(self, frames: Float[torch.Tensor, "batch_size 4 3 3"], center: Float[torch.Tensor, "batch_size 1 3"]) -> None:
+        assert len(frames) == len(self.coords), "batch mismatch"
+        framed_coords = apply_frames(self.coords, self.common_token_mask, frames, center)
+        self.coords = framed_coords
+        self.sequence = self.sequence.repeat_interleave(4, dim=0)
+        self.padding_mask = self.padding_mask.repeat_interleave(4, dim=0)
+
 
 @dataclass
-class InFrameOutput:
-    logits: Float[torch.Tensor, "batch_size d_seq_len vocab_size"]
-    coords_in_frame: Float[torch.Tensor, "batch_size d_seq_len num_atoms*3"]
+class T5Input:
+    encoder_input: TransformerInput
+    decoder_input: TransformerInput
+
+@dataclass
+class EncoderOutput:
+    encoder_embedding: Float[torch.Tensor, "fbatch_size e_seq_len dim"]
+    encoder_padding_mask: Float[torch.Tensor, "batch_size e_seq_len"]
+    frames: Float[torch.Tensor, "batch_size 4 3 3"]
+    center: Float[torch.Tensor, "batch_size 1 3"]
+
+@dataclass
+class DecoderOutput:
+    logits: Float[torch.Tensor, "fbatch_size d_seq_len vocab_size"]
+    coords_in_frame: Float[torch.Tensor, "fbatch_size d_seq_len 9"]
+    common_token_mask: Float[torch.Tensor, "batch_size d_seq_len"]
+    frames: Float[torch.Tensor, "batch_size 4 3 3"]
+    center: Float[torch.Tensor, "batch_size 1 3"]
+
+    def invert_frames(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        coords = invert_frames(
+            self.coords_in_frame, 
+            self.common_token_mask,
+            self.frames,
+            self.center).reshape(self.common_token_mask.shape + [3, 3])
+        logits = self.logits.reshape([-1, 4] + self.logits.shape[1:]).mean(dim=1)
+        return logits, coords
 
 
 class EncoderBlock(torch.nn.Module):
@@ -76,11 +131,11 @@ class DecoderBlock(torch.nn.Module):
         return out
     
 class T5Encoder(torch.nn.Module):
-    def __init__(self, dim: int, num_layers: int, heads: int, attn_drop: float, dense_drop: float) -> None:
+    def __init__(self, dim: int, num_layers: int, heads: int, attn_drop: float, dense_drop: float, max_len: int = 1000) -> None:
         super().__init__()
         self.head_dim = dim // heads
         self.layers = torch.nn.ModuleList([EncoderBlock(dim, heads, attn_drop, dense_drop) for _ in range(num_layers)])
-
+        self.register_buffer("freq", precomputed_theta_pos_frequencies(self.head_dim, max_len))
     def forward(
             self, 
             e_x: Float[torch.Tensor, "batch_size e_seq_len dim"], 
@@ -93,7 +148,7 @@ class T5Encoder(torch.nn.Module):
         Returns:
             x: (B, S, D)
         """
-        freq = precomputed_theta_pos_frequencies(self.head_dim, e_x.shape[1]).to(e_x.device)
+        freq = self.freq[: e_x.shape[1]]
         for layer in self.layers:
             e_x = layer(e_x, freq, key_padding_mask=e_key_padding_mask)
         return e_x
@@ -101,12 +156,13 @@ class T5Encoder(torch.nn.Module):
 
 class T5Decoder(torch.nn.Module):
     def __init__(
-        self, dim: int, num_layers: int, heads: int, attn_drop: float, dense_drop: float, max_len: int = 500
+        self, dim: int, num_layers: int, heads: int, attn_drop: float, dense_drop: float, max_len: int = 1000
     ) -> None:
         super().__init__()
         self.head_dim = dim // heads
         self.max_len = max_len
         self.layers = torch.nn.ModuleList([DecoderBlock(dim, heads, attn_drop, dense_drop) for _ in range(num_layers)])
+        self.register_buffer("freq", precomputed_theta_pos_frequencies(self.head_dim, self.max_len))
 
     def forward(
         self,
@@ -127,12 +183,11 @@ class T5Decoder(torch.nn.Module):
         Returns:
             x: (B, T, D)
         """
-        freq = precomputed_theta_pos_frequencies(self.head_dim, self.max_len).to(d_x.device)
         if decoding_pos is not None:
-            freq_d = freq[:decoding_pos]
+            freq_d = self.freq[:decoding_pos]
         else:
-            freq_d = freq[: d_x.shape[1]]
-        freq_e = freq[: e_x.shape[1]]
+            freq_d = self.freq[: d_x.shape[1]]
+        freq_e = self.freq[: e_x.shape[1]]
         for layer in self.layers:
             d_x = layer(d_x, e_x, freq_d, freq_e, d_key_padding_mask, e_key_padding_mask, cache_kv=cache_kv)
         return d_x
@@ -141,7 +196,6 @@ class T5_3DTransformer(torch.nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        num_atoms: int,
         hidden_dim: int,
         num_heads: int = 8,
         n_layers: int = 8,
@@ -151,7 +205,7 @@ class T5_3DTransformer(torch.nn.Module):
     ) -> None:
         super().__init__()
         self.seq_embedder = torch.nn.Embedding(vocab_size, hidden_dim)
-        self.coords_embedder = torch.nn.Linear(num_atoms * 3, hidden_dim, bias=False)
+        self.coords_embedder = torch.nn.Linear(9, hidden_dim, bias=False)
         self.encoder = T5Encoder(
             dim=hidden_dim,
             num_layers=n_layers,
@@ -174,25 +228,59 @@ class T5_3DTransformer(torch.nn.Module):
         self.coords_predictor = torch.nn.Sequential(
             torch.nn.Linear(hidden_dim, hidden_dim, bias=False),
             torch.nn.SiLU(),
-            torch.nn.Linear(hidden_dim, num_atoms * 3, bias=False),
+            torch.nn.Linear(hidden_dim, 9, bias=False),
         )
 
-    def forward(self, input_data: InFrameInput) -> torch.Tensor:
-        encoder_seq = input_data.EncoderSequence  # (B*4, S)
-        encoder_coords = input_data.EncoderSequence # (B*4, S, N*3)
-        encoder_mask = input_data.Encodermask  # (B*4, S)
-        decoder_seq = input_data.DecoderSequence
-        decoder_coords = input_data.Decodercoords
-        decoder_mask = input_data.Decodermask
+    def forward(self, input_data: T5Input) -> DecoderOutput:
+        encoder_output = self.encode(input_data.encoder_input)
+        output = self.decode(
+            input_data.decoder_input, encoder_output.encoder_embedding, input_data.encoder_input.padding_mask
+        )
+        return output
+    
+    def encode(self, encoder_input: TransformerInput) -> EncoderOutput:
+        frames, center = encoder_input.create_frames()
+        encoder_input.apply_frames(frames, center)
+        encoder_seq = encoder_input.sequence
+        encoder_coords = encoder_input.coords
+        encoder_mask = encoder_input.padding_mask
 
         e_x = self.seq_embedder(encoder_seq) + self.coords_embedder(encoder_coords)
+        e_x = self.encoder(e_x, encoder_mask)
+        return EncoderOutput(
+            encoder_embedding=e_x,
+            encoder_padding_mask=encoder_mask,
+            frames=frames,
+            center=center,
+        )
+    
+    def decode(
+            self, 
+            decoder_input: TransformerInput, 
+            encoder_output: EncoderOutput,
+            cache_kv: bool = False,
+            decoding_pos: int = None,
+            ) -> Float[torch.Tensor, "batch_size d_seq_len vocab_size"]:
+        frames = encoder_output.frames
+        center = encoder_output.center
+        encoder_embedding = encoder_output.encoder_embedding
+        encoder_padding_mask = encoder_output.encoder_padding_mask
+        decoder_input.apply_frames(frames, center)
+
+        decoder_seq = decoder_input.sequence
+        decoder_coords = decoder_input.coords
+        decoder_mask = decoder_input.padding_mask
+
         d_x = self.seq_embedder(decoder_seq) + self.coords_embedder(decoder_coords)
-
-        e_x = self.encoder(e_x, encoder_mask.repeat_interleave(4, dim=0))
-        d_x = self.decoder(d_x, e_x, decoder_mask, encoder_mask)
-
+        d_x = self.decoder(d_x, encoder_embedding, decoder_mask, encoder_padding_mask, cache_kv=cache_kv, decoding_pos=decoding_pos)
         logits = self.seq_predictor(d_x)
         coords_in_frame = self.coords_predictor(d_x)
-        return InFrameOutput(logits, coords_in_frame)
+        return DecoderOutput(
+            logits=logits,
+            coords_in_frame=coords_in_frame,
+            common_token_mask=decoder_input.common_token_mask,
+            frames=frames,
+            center=center,
+        )
 
     
