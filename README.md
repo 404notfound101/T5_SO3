@@ -1,4 +1,4 @@
-# T5_SO3
+# T5_SO3 (On Working)
 
 SO3-equivariant T5 transformer for conditional 3D graph generation, with a detailed example of protein design
 
