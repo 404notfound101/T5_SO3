@@ -1,6 +1,5 @@
 import torch
 import random
-import pandas as pd
 from torch.utils.data import Dataset
 from typing import List, Dict, Tuple
 from GraphT5_3D.data.dispatcher import DispatcherFactory
@@ -8,26 +7,28 @@ from GraphT5_3D.data.tokenizer import ProteinTokenizer
 from GraphT5_3D.data.protein import Protein, parse_pdb
 from GraphT5_3D.nn.model import T5Input
 
+
 class ProteinDataset(Dataset):
     def __init__(
-            self,
-            config: Dict,
+        self,
+        config: Dict,
     ) -> None:
-        self.dispatcher = DispatcherFactory.get_dispatcher(config["dispatcher"]["name"])(**config["dispatcher"])
+        self.dispatcher = DispatcherFactory.get_dispatcher(
+            config["dispatcher"]["name"]
+        )(**config["dispatcher"])
         self.tokenizer = ProteinTokenizer(**config["tokenizer"])
         self.max_len = config.get("max_len", 1024)
         self.min_span_length = config.get("min_span_length", 1)
         self.max_span_length = config.get("max_span_length", 10)
-    
+
     def __len__(self) -> int:
         return len(self.dispatcher)
-    
+
     def __getitem__(self, idx):
         protein = parse_pdb(self.dispatcher[idx]).cutoff(self.max_len)
         mask_regions = self.random_mask(protein)
         encoder_protein, decoder_protein = self.apply_mask(protein, mask_regions)
         return [encoder_protein, decoder_protein]
-
 
     def random_mask(self, seq_len: int) -> List[List[int]]:
         """
@@ -45,12 +46,16 @@ class ProteinDataset(Dataset):
         for i in range(num_spans):
             region_start = region_len * i
             region_end = region_len * (i + 1)
-            span_length = random.randint(self.min_span_length, min(self.max_span_length, region_len))
+            span_length = random.randint(
+                self.min_span_length, min(self.max_span_length, region_len)
+            )
             start = random.randint(region_start, region_end - span_length)
             mask_regions.append([start, span_length])
         return mask_regions
 
-    def apply_mask(self, protein: Protein, mask_regions: List[List[int]]) -> Tuple[Protein]:
+    def apply_mask(
+        self, protein: Protein, mask_regions: List[List[int]]
+    ) -> Tuple[Protein]:
         """
         T5-style masking of the input sequence.
         E.g. Thank you for inviting me to your party last week.
@@ -81,8 +86,10 @@ class ProteinDataset(Dataset):
             start, length = region
             # encoder
             encoder_part_length = start - input_pointer
-            encoder_seq += protein.sequence[input_pointer: start]
-            encoder_coords[encoder_pointer: encoder_pointer + encoder_part_length] = protein.backbones[input_pointer: start]
+            encoder_seq += protein.sequence[input_pointer:start]
+            encoder_coords[encoder_pointer : encoder_pointer + encoder_part_length] = (
+                protein.backbones[input_pointer:start]
+            )
             encoder_pointer += encoder_part_length
             encoder_seq += [f"<extra_id_{i}>"]
             encoder_coords[encoder_pointer] = torch.zeros(3, 3)
@@ -93,8 +100,10 @@ class ProteinDataset(Dataset):
             decoder_coords[decoder_pointer] = torch.zeros(3, 3)
             decoder_common_token_mask[decoder_pointer] = 1
             decoder_pointer += 1
-            decoder_seq += protein.sequence[start: start + length]
-            decoder_coords[decoder_pointer: decoder_pointer + length] = protein.backbones[start: start + length]
+            decoder_seq += protein.sequence[start : start + length]
+            decoder_coords[decoder_pointer : decoder_pointer + length] = (
+                protein.backbones[start : start + length]
+            )
             decoder_pointer += length
             input_pointer = start + length
         decoder_seq += [f"<extra_id_{i+1}>"]
@@ -116,6 +125,10 @@ class ProteinDataset(Dataset):
         return encoder_protein, decoder_protein
 
     def collate_fn(self, batch: List[List[Protein]]) -> T5Input:
-        encoder_inputs = self.tokenizer.encode([protein[0] for protein in batch], left_padding=False, max_len=self.max_len)
-        decoder_inputs = self.tokenizer.encode([protein[1] for protein in batch], left_padding=True, max_len=self.max_len)
+        encoder_inputs = self.tokenizer.encode(
+            [protein[0] for protein in batch], left_padding=False, max_len=self.max_len
+        )
+        decoder_inputs = self.tokenizer.encode(
+            [protein[1] for protein in batch], left_padding=True, max_len=self.max_len
+        )
         return T5Input(encoder_input=encoder_inputs, decoder_input=decoder_inputs)

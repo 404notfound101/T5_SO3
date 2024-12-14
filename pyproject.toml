@@ -1,0 +1,34 @@
+[project]
+name = "GraphT5-3D"
+
+[tool.poetry]
+name = "GraphT5-3D"
+version = "0.0.1"
+description = ""
+authors = []
+readme = "README.md"
+license = "MIT"
+packages = [
+    { include = "GraphT5_3D" }
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11, <3.12"
+gemmi = "^0.7.0"
+torch = { version = "^2.5.1+cu121", source = "torch_repo" }
+jaxtyping = "^0.2.36"
+pandas = "^2.2.3"
+scipy = "^1.14.1"
+
+[tool.poetry.dev-dependencies]
+pytest = "^8.3.4"
+pre-commit = "^2.15.0"
+
+[[tool.poetry.source]]
+name = "torch_repo"
+url = "https://download.pytorch.org/whl/cu121"
+priority = "explicit"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
