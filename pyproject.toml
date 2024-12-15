@@ -29,6 +29,9 @@ name = "torch_repo"
 url = "https://download.pytorch.org/whl/cu121"
 priority = "explicit"
 
+[tool.ruff]
+lint.ignore = ["F722", "F821"]
+
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"

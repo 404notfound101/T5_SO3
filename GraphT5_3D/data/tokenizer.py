@@ -39,7 +39,7 @@ class ProteinTokenizer:
             backbones = protein.backbones
             common_token_mask = protein.common_res_mask
             if left_padding:
-                offset = length - len(sequence) - 1
+                offset = length - len(sequence)
             else:
                 offset = 0
             encoded_sequence[i, offset] = self.token_to_id["<cls>"]
