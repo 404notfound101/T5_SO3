@@ -7,10 +7,12 @@ from pathlib import Path
 import gzip
 from typing import List
 
+
 @dataclass
 class ProteinFile:
     pdb_path: str
     chains: List[str]
+
 
 @dataclass
 class Residue:
@@ -18,9 +20,10 @@ class Residue:
     N: Float[torch.Tensor, "3"]
     CA: Float[torch.Tensor, "3"]
     C: Float[torch.Tensor, "3"]
-    
+
     def __repr__(self):
         return f"{self.name} - N: {self.N}, CA: {self.CA}, C: {self.C}"
+
 
 @dataclass
 class Protein:
@@ -31,25 +34,25 @@ class Protein:
 
     def __post_init__(self):
         assert len(self.sequence) == len(self.backbones), "Length mismatch"
-    
+
     def __len__(self):
         return len(self.sequence)
-    
+
     def __getitem__(self, key: int | slice) -> Residue | Protein:
         if isinstance(key, slice):
             return Protein(
                 name=self.name,
                 sequence=self.sequence[key],
                 backbones=self.backbones[key],
-                common_res_mask=self.common_res_mask[key]
+                common_res_mask=self.common_res_mask[key],
             )
         return Residue(
             name=self.sequence[key],
             N=self.backbones[key][0],
             CA=self.backbones[key][1],
-            C=self.backbones[key][2]
+            C=self.backbones[key][2],
         )
-    
+
     def cutoff(self, length: int) -> Protein:
         if len(self) <= length:
             return self
@@ -57,72 +60,59 @@ class Protein:
             name=self.name,
             sequence=self.sequence[:length],
             backbones=self.backbones[:length],
-            common_res_mask=self.common_res_mask[:length]
+            common_res_mask=self.common_res_mask[:length],
         )
-    
+
     def __repr__(self):
         return f"{self.name} - {''.join(self.sequence)}"
+
 
 def parse_pdb(pdb_file: ProteinFile) -> Protein:
     file_path = Path(pdb_file.pdb_path)
     if file_path.suffix == ".gz":
-        pose = gemmi.read_pdb_string(gzip.open(pdb_file, mode="rt").read())
+        pose = gemmi.read_pdb_string(gzip.open(pdb_file.pdb_path, mode="rt").read())
     elif file_path.suffix == ".pdb":
-        pose = gemmi.read_structure(pdb_file)
+        pose = gemmi.read_structure(pdb_file.pdb_path)
     elif file_path.suffix == ".cif":
-        pose = gemmi.read_structure(pdb_file)
+        pose = gemmi.read_structure(pdb_file.pdb_path, merge_chain_parts=False)
     else:
         raise ValueError("Unsupported file format")
-    
+
     model = pose[0]
-    N_coords = []
-    CA_coords = []
-    C_coords = []
+    coords = []
     full_seq = []
     for chain_id in pdb_file.chains:
-        assert chain_id in model, f"Chain {chain_id} not found in the PDB file"
-        chain = model[chain]
+        chain = model.find_chain(chain_id)
+        if chain is None:
+            raise ValueError(f"Chain {chain_id} not found in the PDB file")
         seq = []
-        backbone_N = torch.empty(len(chain), 3)
-        backbone_CA = torch.empty(len(chain), 3)
-        backbone_C = torch.empty(len(chain), 3)
+        backbone = torch.empty(len(chain), 3, 3)
         for i, res in enumerate(chain):
             keep = torch.ones(len(chain), dtype=torch.bool)
-            if not "CA" in res:
+            if "CA" not in res:
                 # skip if CA is missing
                 keep[i] = False
                 continue
             else:
-                backbone_CA[i] = torch.tensor(res["CA"][0].pos.tolist())
+                backbone[i, 1] = torch.tensor(res["CA"][0].pos.tolist())
             if "N" in res:
-                backbone_N[i] = torch.tensor(res["N"][0].pos.tolist())
+                backbone[i, 0] = torch.tensor(res["N"][0].pos.tolist())
             else:
-                backbone_N[i] = torch.tensor(res["CA"][0].pos.tolist())
+                backbone[i, 0] = torch.tensor(res["CA"][0].pos.tolist())
             if "C" in res:
-                backbone_C[i] = torch.tensor(res["C"][0].pos.tolist())
+                backbone[i, 2] = torch.tensor(res["C"][0].pos.tolist())
             else:
-                backbone_C[i] = torch.tensor(res["CA"][0].pos.tolist())
+                backbone[i, 2] = torch.tensor(res["CA"][0].pos.tolist())
             seq.append(res.name)
-        backbone_N = backbone_N[keep]
-        backbone_CA = backbone_CA[keep]
-        backbone_C = backbone_C[keep]
+        backbone = backbone[keep]
         seq = gemmi.one_letter_code(seq)
-        assert len(seq) == len(backbone_CA)
+        assert len(seq) == len(backbone)
         full_seq += seq
-        N_coords.append(backbone_N)
-        CA_coords.append(backbone_CA)
-        C_coords.append(backbone_C)
-    
+        coords.append(backbone)
+
     return Protein(
-        name=pdb_file.pdb_path.stem,
+        name=file_path.stem,
         sequence=full_seq,
-        N=torch.cat(N_coords),
-        CA=torch.cat(CA_coords),
-        C=torch.cat(C_coords)
+        backbones=torch.cat(coords, dim=0),
+        common_res_mask=torch.ones(len(full_seq)),
     )
-
-        
-        
-
-
-    

@@ -26,11 +26,11 @@ class ProteinDataset(Dataset):
 
     def __getitem__(self, idx):
         protein = parse_pdb(self.dispatcher[idx]).cutoff(self.max_len)
-        mask_regions = self.random_mask(protein)
+        mask_regions = self.generate_mask(protein)
         encoder_protein, decoder_protein = self.apply_mask(protein, mask_regions)
         return [encoder_protein, decoder_protein]
 
-    def random_mask(self, seq_len: int) -> List[List[int]]:
+    def generate_mask(self, seq_len: int) -> List[List[int]]:
         """
         Randomly generate mask regions
         Args:
@@ -90,25 +90,33 @@ class ProteinDataset(Dataset):
             encoder_coords[encoder_pointer : encoder_pointer + encoder_part_length] = (
                 protein.backbones[input_pointer:start]
             )
+            encoder_common_token_mask[
+                encoder_pointer : encoder_pointer + encoder_part_length
+            ] = protein.common_res_mask[input_pointer:start]
             encoder_pointer += encoder_part_length
             encoder_seq += [f"<extra_id_{i}>"]
             encoder_coords[encoder_pointer] = torch.zeros(3, 3)
-            encoder_common_token_mask[encoder_pointer] = 1
             encoder_pointer += 1
             # decoder
             decoder_seq += [f"<extra_id_{i}>"]
             decoder_coords[decoder_pointer] = torch.zeros(3, 3)
-            decoder_common_token_mask[decoder_pointer] = 1
             decoder_pointer += 1
             decoder_seq += protein.sequence[start : start + length]
             decoder_coords[decoder_pointer : decoder_pointer + length] = (
                 protein.backbones[start : start + length]
             )
+            decoder_common_token_mask[decoder_pointer : decoder_pointer + length] = (
+                protein.common_res_mask[start : start + length]
+            )
             decoder_pointer += length
             input_pointer = start + length
+        encoder_seq += protein.sequence[input_pointer:]
+        encoder_coords[encoder_pointer:] = protein.backbones[input_pointer:]
+        encoder_common_token_mask[encoder_pointer:] = protein.common_res_mask[
+            input_pointer:
+        ]
         decoder_seq += [f"<extra_id_{i+1}>"]
         decoder_coords[decoder_pointer] = torch.zeros(3, 3)
-        decoder_common_token_mask[decoder_pointer] = 1
 
         encoder_protein = Protein(
             name=f"{protein.name}_encoder",
